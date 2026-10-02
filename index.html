@@ -395,6 +395,7 @@ dialog .df{display:flex;justify-content:space-between;align-items:center;gap:8px
 
 <div class="toast" id="toast"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 /* ============================================================
    데이터 모델
@@ -496,15 +497,14 @@ async function initStorage(){
     db = window.claude && window.claude.use ? await window.claude.use('db') : null;
     downloads = window.claude && window.claude.use ? await window.claude.use('downloads') : null;
   }catch(e){ db=null; }
-  if(!db){
-    /* GitHub Pages 등 정적 배포: 저장소의 data.json이 더 최신이면 불러옴 */
-    try{
-      const r=await fetch('data.json',{cache:'no-store'});
-      if(r.ok){ const seed=normalize(await r.json()); if(!local || seed.updatedAt>state.updatedAt){ state=seed; writeLocal(); } }
-    }catch(e){ console.warn('data.json unavailable',e); }
+  if(db) docRef=db.doc('app/state');
+  else { try{ docRef=await supabaseDoc(); }catch(e){ console.warn('supabase unavailable',e); docRef=null; } }
+  if(!docRef){
+    /* 공유 DB 없음: data.json이 더 최신이면 불러와 이 브라우저에만 저장 */
+    const seed=await loadSeed();
+    if(seed && (!local || seed.updatedAt>state.updatedAt)){ state=seed; writeLocal(); }
     setSave('local','이 브라우저에 저장됨'); render(); return;
   }
-  docRef=db.doc('app/state');
   try{
     const snap=await docRef.get();
     if(snap.exists){
@@ -512,15 +512,46 @@ async function initStorage(){
       if(!local || remote.updatedAt>=state.updatedAt){ state=remote; writeLocal(); }
       else { save(); }
       setSave('ok','저장됨');
-    } else if(local && state.tasks.length){ save(); }
-    else { setSave('ok','저장됨'); }
+    } else {
+      const seed=local?null:await loadSeed();
+      if(seed){ state=seed; }
+      if(state.tasks.length||state.avail.length){ save(); } else { setSave('ok','저장됨'); }
+    }
     render();
-    docRef.onSnapshot(s=>{
+    const onRemote=s=>{
       if(!s.exists || s.metadata.hasPendingWrites) return;
       const remote=normalize(s.data());
       if(remote.updatedAt>state.updatedAt && !dirty){ state=remote; writeLocal(); render(); }
-    }, e=>{ console.warn('snapshot error',e); });
+    };
+    docRef.onSnapshot(onRemote, e=>{ console.warn('snapshot error',e); });
+    /* 탭으로 돌아올 때 한 번 더 확인 (실시간 연결이 끊겼을 때 대비) */
+    document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible' && docRef) docRef.get().then(onRemote).catch(()=>{}); });
   }catch(e){ console.warn('db unavailable',e); docRef=null; setSave('local','이 브라우저에 저장됨'); render(); }
+}
+
+async function loadSeed(){
+  try{ const r=await fetch('data.json',{cache:'no-store'}); return r.ok?normalize(await r.json()):null; }
+  catch(e){ console.warn('data.json unavailable',e); return null; }
+}
+
+/* Supabase(app_state 테이블의 한 행)를 db.doc()과 같은 모양으로 감쌈 */
+async function supabaseDoc(){
+  if(!window.supabase) return null;
+  const r=await fetch('/api/config',{cache:'no-store'});
+  if(!r.ok) return null;
+  const cfg=await r.json();
+  if(!cfg.url||!cfg.anonKey) return null;
+  const sb=window.supabase.createClient(cfg.url,cfg.anonKey);
+  const ID='main', snap=row=>({exists:!!row, metadata:{hasPendingWrites:false}, data:()=>row&&row.data});
+  return {
+    async get(){ const {data,error}=await sb.from('app_state').select('data').eq('id',ID).maybeSingle(); if(error) throw error; return snap(data); },
+    async set(v){ const {error}=await sb.from('app_state').upsert({id:ID,data:v,updated_at:Number(v.updatedAt)||Date.now()}); if(error) throw error; },
+    onSnapshot(cb,onErr){
+      sb.channel('app_state:'+ID)
+        .on('postgres_changes',{event:'*',schema:'public',table:'app_state',filter:'id=eq.'+ID},p=>{ if(p.new&&p.new.data) cb(snap(p.new)); })
+        .subscribe((status,err)=>{ if(status==='CHANNEL_ERROR'&&onErr) onErr(err||status); });
+    }
+  };
 }
 
 /* ============================================================
